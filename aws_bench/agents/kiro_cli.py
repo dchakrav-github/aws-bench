@@ -51,9 +51,17 @@ from harbor.models.trajectories import (
 
 from aws_bench.cli.preflight import PreflightError
 
-_OUTPUT_FILENAME = "kiro-cli.txt"
-_DB_FILENAME = "kiro-cli-data.sqlite3"
+_STREAM_JSON_FILENAME = "kiro-cli-stream.jsonl"
+_STREAM_ERR_FILENAME = "kiro-cli-stream.err"
 _CONTAINER_DB_PATH = "~/.local/share/kiro-cli/data.sqlite3"
+# Name of the per-trial agent config written to pin the model. kiro-cli's
+# `--model` flag is a no-op in headless v2 (it logs "failed to set model:
+# Method not found" and silently falls back to the default `auto` model). The
+# supported way to pin a model is an agent config carrying a `model` field,
+# launched with `--agent`. This agent is otherwise minimal (built-in default
+# behavior) so only the model is pinned.
+_MODEL_PIN_AGENT = "aws-bench"
+_CONTAINER_AGENT_PATH = f"~/.kiro/agents/{_MODEL_PIN_AGENT}.json"
 # kiro-cli installs into $HOME/.local/bin which is not on PATH for non-login
 # shells spawned by environment.exec.
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
@@ -314,6 +322,30 @@ class KiroCli(BaseInstalledAgent):
             ),
         )
 
+    async def _write_model_pin_agent(self, environment: BaseEnvironment) -> None:
+        """Write a minimal agent config that pins ``self.model_name`` and launch via ``--agent``.
+
+        kiro-cli's ``--model`` flag is not honored in headless mode (it logs
+        "failed to set model: Method not found" and silently runs the default
+        ``auto`` model). The supported mechanism is an agent config with a
+        ``model`` field. This writes an otherwise-minimal agent — full tool
+        access, no extra prompt/skills/MCP — so only the model differs from the
+        built-in default behavior. Verified that the resulting run records the
+        pinned model in the session DB's ``model_info``.
+        """
+        agent_config = {
+            "name": _MODEL_PIN_AGENT,
+            "description": "aws-bench trial agent (model pinned).",
+            "model": self.model_name,
+            "tools": ["*"],
+            "allowedTools": ["*"],
+        }
+        escaped = shlex.quote(json.dumps(agent_config))
+        await self.exec_as_agent(
+            environment,
+            command=(f"mkdir -p ~/.kiro/agents && echo {escaped} > {_CONTAINER_AGENT_PATH}"),
+        )
+
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
@@ -341,7 +373,11 @@ class KiroCli(BaseInstalledAgent):
             )
 
         escaped_instruction = shlex.quote(instruction)
-        model_flag = f"--model {shlex.quote(self.model_name)} " if self.model_name else ""
+        # Pin the model via an agent config (--model is a no-op in headless v2).
+        agent_flag = ""
+        if self.model_name:
+            await self._write_model_pin_agent(environment)
+            agent_flag = f"--agent {shlex.quote(_MODEL_PIN_AGENT)} "
         cli_flags = self.build_cli_flags()
         extra_flags = (cli_flags + " ") if cli_flags else ""
 
@@ -373,47 +409,45 @@ class KiroCli(BaseInstalledAgent):
                 env=env or None,
             )
 
+        # Emit structured stream-json (JSON Lines) as the single source for the
+        # ATIF trajectory. kiro-cli headless does NOT persist conversations to its
+        # SQLite DB (that only happens for interactive sessions), so stream-json is
+        # the only reliable record of steps/tool-calls/cost for a headless run.
         run_command = (
             f"{_PATH_PREFIX}"
             f"kiro-cli chat --trust-all-tools --no-interactive "
-            f"{model_flag}"
+            f"--output-format stream-json "
+            f"{agent_flag}"
             f"{extra_flags}"
-            f"{escaped_instruction} 2>&1 </dev/null | "
-            f"tee /logs/agent/{_OUTPUT_FILENAME}"
+            f"{escaped_instruction} </dev/null "
+            f"> /logs/agent/{_STREAM_JSON_FILENAME} 2> /logs/agent/{_STREAM_ERR_FILENAME}"
         )
-        try:
-            await self.exec_as_agent(environment, command=run_command, env=env or None)
-        finally:
-            # Copy the SQLite DB to logs so populate_context_post_run can read it
-            try:
-                await self.exec_as_agent(
-                    environment,
-                    command=(
-                        f"cp {_CONTAINER_DB_PATH} /logs/agent/{_DB_FILENAME} 2>/dev/null || true"
-                    ),
-                )
-            except Exception:
-                pass
+        await self.exec_as_agent(environment, command=run_command, env=env or None)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
-        """Extract conversation from SQLite DB and build ATIF trajectory."""
-        db_path = self.logs_dir / _DB_FILENAME
-        if not db_path.exists():
-            self.logger.debug("No Kiro CLI database found at %s", db_path)
+        """Build the ATIF trajectory from kiro-cli's stream-json output.
+
+        stream-json (JSON Lines) is the single trajectory source: headless runs
+        do not persist a conversation to SQLite, so this is the only reliable
+        record of the run's steps, tool calls, and cost.
+        """
+        stream_path = self.logs_dir / _STREAM_JSON_FILENAME
+        if not stream_path.exists():
+            self.logger.debug("No Kiro CLI stream-json found at %s", stream_path)
             return
 
-        conversation = self._extract_conversation(db_path)
-        if not conversation:
-            self.logger.debug("No conversation data found in Kiro CLI database")
+        events = self._read_stream_json(stream_path)
+        if not events:
+            self.logger.debug("No stream-json events parsed from %s", stream_path)
             return
 
         try:
-            trajectory = self._convert_conversation_to_trajectory(conversation)
+            trajectory = self._stream_json_to_trajectory(events)
         except Exception as exc:
-            self.logger.debug("Failed to convert Kiro CLI conversation to trajectory: %s", exc)
+            self.logger.debug("Failed to convert stream-json to trajectory: %s", exc)
             return
         if not trajectory:
-            self.logger.debug("Failed to convert conversation to trajectory")
+            self.logger.debug("Failed to convert stream-json to trajectory")
             return
 
         trajectory_path = self.logs_dir / "trajectory.json"
@@ -428,211 +462,239 @@ class KiroCli(BaseInstalledAgent):
         if trajectory.final_metrics:
             context.cost_usd = trajectory.final_metrics.total_cost_usd
 
-    def _extract_conversation(self, db_path: Path) -> dict[str, Any] | None:
-        """Read the most recent conversation from the kiro-cli SQLite database."""
+    def _read_stream_json(self, path: Path) -> list[dict[str, Any]]:
+        """Parse a stream-json (JSON Lines) file into a list of event dicts.
+
+        Malformed lines are skipped so a single truncated/partial line (e.g. an
+        interrupted run) never discards the whole trajectory.
+        """
+        events: list[dict[str, Any]] = []
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            cursor = conn.execute(
-                "SELECT value FROM conversations_v2 ORDER BY created_at DESC LIMIT 1;"
-            )
-            row = cursor.fetchone()
-            conn.close()
-        except (sqlite3.Error, OSError) as exc:
-            self.logger.debug("SQLite read failed: %s", exc)
-            return None
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        events.append(obj)
+        except OSError as exc:
+            self.logger.debug("Failed to read stream-json %s: %s", path, exc)
+            return []
+        return events
 
-        if not row:
-            return None
+    def _stream_json_to_trajectory(self, events: list[dict[str, Any]]) -> Trajectory | None:
+        """Convert kiro-cli stream-json events into an ATIF Trajectory.
 
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return None
+        Event model (kiro-cli ``--output-format stream-json``):
 
-    def _convert_conversation_to_trajectory(
-        self, conversation: dict[str, Any]
-    ) -> Trajectory | None:
-        """Convert a kiro-cli conversation dict to an ATIF Trajectory."""
-        history = conversation.get("history", [])
-        if not history:
-            return None
+        - ``runStarted``  — ``data.engine``.
+        - ``metadata``    — repeated; the final one carries ``meteringUsage``
+          (credits), ``turnDurationMs``, ``sessionId``.
+        - ``sessionUpdate`` with ``data.update.sessionUpdate`` one of:
+          ``tool_call`` (new call: ``toolCallId``, ``rawInput`` args,
+          ``_meta.kiro.toolName``), ``tool_call_update`` (``status``,
+          ``rawOutput.items[].Json`` with exit_status/stdout/stderr),
+          ``agent_message_chunk`` (streamed assistant text), and
+          ``agent_thought_chunk`` (reasoning; not emitted as steps).
+        - ``runFinished`` — ``status``, ``stopReason``, ``finalText``.
 
-        # Build set of answered tool_use_ids
-        answered_ids: set[str] = set()
-        for turn in history:
-            user_content = (turn.get("user") or {}).get("content") or {}
-            if "ToolUseResults" in user_content:
-                for tr in user_content["ToolUseResults"].get("tool_use_results", []):
-                    answered_ids.add(tr.get("tool_use_id", ""))
+        Each tool call becomes one agent Step (tool_call + its observation);
+        the assembled assistant text becomes a final agent Step.
+        """
+        session_id = "unknown"
+        engine: str | None = None
+        credits_total = 0.0
+        credits_seen = False
+        duration_ms: int | None = None
+        final_status: str | None = None
+        final_text: str | None = None
 
-        steps: list[Step] = []
-        model_id = (conversation.get("model_info") or {}).get("model_id") or self.model_name
+        # toolCallId -> {name, args, purpose, title, observation, status}
+        tool_calls: dict[str, dict[str, Any]] = {}
+        tool_order: list[str] = []
+        assistant_text_parts: list[str] = []
 
-        for turn in history:
-            user_content = (turn.get("user") or {}).get("content") or {}
-            assistant = turn.get("assistant") or {}
-            meta = turn.get("request_metadata") or {}
+        for event in events:
+            etype = event.get("type")
+            data = event.get("data") or {}
+            if data.get("sessionId"):
+                session_id = data["sessionId"]
 
-            # Timestamps: user prompt has user.timestamp, agent response uses
-            # request_start for the LLM call and stream_end for completion.
-            user_ts = (turn.get("user") or {}).get("timestamp")
-            agent_ts = self._ms_to_iso(meta.get("stream_end_timestamp_ms"))
-
-            # User prompt
-            if "Prompt" in user_content:
-                steps.append(
-                    Step(
-                        step_id=len(steps) + 1,
-                        source="user",
-                        message=user_content["Prompt"].get("prompt", ""),
-                        timestamp=user_ts,
-                    )
+            if etype == "runStarted":
+                engine = data.get("engine")
+            elif etype == "metadata":
+                metering = data.get("meteringUsage")
+                if metering:
+                    credits_seen = True
+                    credits_total = sum(float(m.get("value", 0) or 0) for m in metering)
+                if data.get("turnDurationMs") is not None:
+                    duration_ms = data.get("turnDurationMs")
+            elif etype == "runFinished":
+                final_status = data.get("status")
+                final_text = data.get("finalText")
+            elif etype == "sessionUpdate":
+                self._apply_session_update(
+                    data.get("update") or {},
+                    tool_calls,
+                    tool_order,
+                    assistant_text_parts,
                 )
 
-            # Assistant response
-            if isinstance(assistant, dict):
-                if "ToolUse" in assistant:
-                    tool_use_data = assistant["ToolUse"]
-                    tool_calls = []
-                    for tu in tool_use_data.get("tool_uses", []):
-                        tool_calls.append(
-                            ToolCall(
-                                tool_call_id=tu.get("id", ""),
-                                function_name=tu.get("name", "unknown"),
-                                arguments=tu.get("args", {}),
-                            )
+        steps: list[Step] = []
+        n_tool_errors = 0
+        for call_id in tool_order:
+            call = tool_calls[call_id]
+            if call.get("is_error"):
+                n_tool_errors += 1
+            args = dict(call.get("args") or {})
+            purpose = args.pop("__tool_use_purpose", None)
+            observation = None
+            if call.get("observation") is not None:
+                observation = Observation(
+                    results=[
+                        ObservationResult(
+                            source_call_id=call_id,
+                            content=call["observation"],
                         )
-                    # Build observation from matching tool results in next turn
-                    observation = self._find_observation_for_tools(
-                        tool_use_data.get("tool_uses", []), history, turn
-                    )
-                    msg = tool_use_data.get("content", "")
-                    steps.append(
-                        Step(
-                            step_id=len(steps) + 1,
-                            source="agent",
-                            message=msg,
-                            tool_calls=tool_calls if tool_calls else None,
-                            observation=observation,
-                            timestamp=agent_ts,
-                            model_name=model_id,
+                    ]
+                )
+            steps.append(
+                Step(
+                    step_id=len(steps) + 1,
+                    source="agent",
+                    message=purpose or call.get("title") or "",
+                    tool_calls=[
+                        ToolCall(
+                            tool_call_id=call_id,
+                            function_name=call.get("name") or "unknown",
+                            arguments=args,
                         )
-                    )
-                elif "Response" in assistant:
-                    steps.append(
-                        Step(
-                            step_id=len(steps) + 1,
-                            source="agent",
-                            message=assistant["Response"].get("content", ""),
-                            timestamp=agent_ts,
-                            model_name=model_id,
-                        )
-                    )
+                    ],
+                    observation=observation,
+                    model_name=self.model_name,
+                )
+            )
+
+        assistant_message = "".join(assistant_text_parts).strip() or (final_text or "")
+        if assistant_message:
+            steps.append(
+                Step(
+                    step_id=len(steps) + 1,
+                    source="agent",
+                    message=assistant_message,
+                    model_name=self.model_name,
+                )
+            )
 
         if not steps:
             return None
 
-        # Extract native metrics (no token estimates)
-        metrics = self._extract_native_metrics(conversation, history, answered_ids)
+        metrics = FinalMetrics(
+            total_steps=len(steps),
+            total_cost_usd=credits_total if credits_seen else None,
+            extra={
+                "total_tool_calls": len(tool_order),
+                "total_tool_calls_errors": n_tool_errors,
+                "engine": engine,
+                "turn_duration_ms": duration_ms,
+                "stop_status": final_status,
+            },
+        )
 
-        model_info = conversation.get("model_info", {})
         return Trajectory(
             schema_version="ATIF-v1.7",
-            session_id=conversation.get("conversation_id", "unknown"),
+            session_id=session_id,
             agent=Agent(
                 name="kiro-cli",
                 version=self._version or "unknown",
-                model_name=model_info.get("model_id") or self.model_name,
+                model_name=self.model_name,
             ),
             steps=steps,
             final_metrics=metrics,
         )
 
     @staticmethod
-    def _ms_to_iso(ms: int | None) -> str | None:
-        """Convert millisecond epoch timestamp to ISO 8601 string."""
-        if ms is None:
-            return None
-        from datetime import datetime, timezone
-
-        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
-
-    @staticmethod
-    def _find_observation_for_tools(
-        tool_uses: list[dict[str, Any]],
-        history: list[dict[str, Any]],
-        current_turn: dict[str, Any],
-    ) -> Observation | None:
-        """Find tool results for the given tool_uses from subsequent turns."""
-        # Look for tool results in the turn after the current one
-        found_current = False
-        for turn in history:
-            if turn is current_turn:
-                found_current = True
-                continue
-            if found_current:
-                user_content = (turn.get("user") or {}).get("content") or {}
-                if "ToolUseResults" in user_content:
-                    results = []
-                    for tr in user_content["ToolUseResults"].get("tool_use_results", []):
-                        content_parts = tr.get("content", "")
-                        if isinstance(content_parts, list):
-                            text = " ".join(
-                                (
-                                    item.get("Text", json.dumps(item.get("Json", item)))
-                                    if isinstance(item, dict)
-                                    else str(item)
-                                )
-                                for item in content_parts
-                            )
-                        else:
-                            text = str(content_parts)
-                        results.append(
-                            ObservationResult(
-                                source_call_id=tr.get("tool_use_id", ""),
-                                content=text,
-                            )
-                        )
-                    if results:
-                        return Observation(results=results)
-                break
-        return None
+    def _apply_session_update(
+        update: dict[str, Any],
+        tool_calls: dict[str, dict[str, Any]],
+        tool_order: list[str],
+        assistant_text_parts: list[str],
+    ) -> None:
+        """Fold one ``sessionUpdate`` payload into the accumulating trajectory state."""
+        kind = update.get("sessionUpdate")
+        if kind == "tool_call":
+            call_id = update.get("toolCallId") or ""
+            if not call_id:
+                return
+            if call_id not in tool_calls:
+                tool_order.append(call_id)
+            entry = tool_calls.setdefault(call_id, {})
+            entry["name"] = ((update.get("_meta") or {}).get("kiro") or {}).get("toolName")
+            entry["args"] = update.get("rawInput") or {}
+            entry["title"] = update.get("title")
+        elif kind == "tool_call_update":
+            call_id = update.get("toolCallId") or ""
+            if not call_id:
+                return
+            if call_id not in tool_calls:
+                tool_order.append(call_id)
+            entry = tool_calls.setdefault(call_id, {})
+            if update.get("rawInput") and not entry.get("args"):
+                entry["args"] = update.get("rawInput")
+            if update.get("title") and not entry.get("title"):
+                entry["title"] = update.get("title")
+            text, is_error = KiroCli._extract_tool_output(update)
+            if text is not None:
+                entry["observation"] = text
+            if is_error:
+                entry["is_error"] = True
+        elif kind == "agent_message_chunk":
+            content = update.get("content") or {}
+            text = content.get("text") if isinstance(content, dict) else None
+            if text:
+                assistant_text_parts.append(text)
 
     @staticmethod
-    def _extract_native_metrics(
-        conversation: dict[str, Any],
-        history: list[dict[str, Any]],
-        answered_ids: set[str],
-    ) -> FinalMetrics:
-        """Extract only natively-provided metrics from the conversation."""
-        n_tool_calls = 0
-        n_tool_calls_errors = 0
-        n_tool_calls_rejected = 0
+    def _extract_tool_output(update: dict[str, Any]) -> tuple[str | None, bool]:
+        """Return (observation_text, is_error) from a ``tool_call_update`` payload.
 
-        for turn in history:
-            assistant = turn.get("assistant") or {}
-            if isinstance(assistant, dict) and "ToolUse" in assistant:
-                for tu in assistant["ToolUse"].get("tool_uses", []):
-                    n_tool_calls += 1
-                    if tu.get("id", "") not in answered_ids:
-                        n_tool_calls_rejected += 1
+        Prefers the structured ``rawOutput.items[].Json`` (exit_status/stdout/
+        stderr) emitted on completion; falls back to the streamed ``content``
+        text. ``is_error`` is inferred from a non-zero exit status.
+        """
+        raw_output = update.get("rawOutput") or {}
+        items = raw_output.get("items") if isinstance(raw_output, dict) else None
+        if items:
+            parts: list[str] = []
+            is_error = False
+            for item in items:
+                if not isinstance(item, dict):
+                    parts.append(str(item))
+                    continue
+                payload = item.get("Json")
+                if isinstance(payload, dict):
+                    exit_status = str(payload.get("exit_status", ""))
+                    if exit_status and exit_status.strip() not in ("exit status: 0", "0"):
+                        is_error = True
+                    parts.append(json.dumps(payload))
+                elif "Text" in item:
+                    parts.append(str(item.get("Text")))
+                else:
+                    parts.append(json.dumps(item))
+            return (" ".join(parts) if parts else None), is_error
 
-            user_content = (turn.get("user") or {}).get("content") or {}
-            if "ToolUseResults" in user_content:
-                for tr in user_content["ToolUseResults"].get("tool_use_results", []):
-                    if tr.get("status", "success").lower() == "error":
-                        n_tool_calls_errors += 1
-
-        # Credits from usage_info (native cost metric from kiro-cli)
-        usage_info = (conversation.get("user_turn_metadata") or {}).get("usage_info", [])
-        total_credits = sum(entry.get("value", 0) for entry in usage_info) if usage_info else None
-
-        return FinalMetrics(
-            total_steps=len(history),
-            total_cost_usd=total_credits,
-            extra={
-                "total_tool_calls": n_tool_calls,
-                "total_tool_calls_errors": n_tool_calls_errors,
-                "total_tool_calls_rejected": n_tool_calls_rejected,
-            },
-        )
+        content = update.get("content")
+        if isinstance(content, list):
+            texts: list[str] = []
+            for c in content:
+                if isinstance(c, dict):
+                    inner = c.get("content")
+                    if isinstance(inner, dict) and inner.get("text"):
+                        texts.append(inner["text"])
+            if texts:
+                return " ".join(texts), False
+        return None, False

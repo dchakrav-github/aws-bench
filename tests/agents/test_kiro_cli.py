@@ -226,7 +226,8 @@ class TestKiroCliRun:
         assert "--no-interactive" in command
         assert "--trust-all-tools" in command
         assert "Do the task" in command
-        assert "/logs/agent/kiro-cli.txt" in command
+        assert "--output-format stream-json" in command
+        assert "/logs/agent/kiro-cli-stream.jsonl" in command
 
     @pytest.mark.asyncio
     async def test_run_passes_kiro_api_key(self, agent: KiroCli):
@@ -244,8 +245,8 @@ class TestKiroCliRun:
         assert env.get("KIRO_API_KEY") == "ksk_test123"
 
     @pytest.mark.asyncio
-    async def test_run_with_model_flag(self, logs_dir: Path):
-        agent = KiroCli(logs_dir=logs_dir, model_name="sonnet-4")
+    async def test_run_with_model_pins_via_agent_config(self, logs_dir: Path):
+        agent = KiroCli(logs_dir=logs_dir, model_name="claude-opus-5")
         environment = MagicMock()
         environment.exec = AsyncMock(return_value=MagicMock(return_code=0, stdout="", stderr=""))
         context = MagicMock()
@@ -253,9 +254,32 @@ class TestKiroCliRun:
         with patch.dict("os.environ", {"KIRO_API_KEY": "ksk_test"}, clear=True):
             await agent.run("Do the task", environment, context)
 
+        commands = [c.kwargs.get("command", "") for c in environment.exec.call_args_list]
+        # An agent config file is written that pins the model.
+        agent_write_cmds = [c for c in commands if "~/.kiro/agents/aws-bench.json" in c]
+        assert agent_write_cmds, "expected an agent config to be written for model pinning"
+        assert '"model": "claude-opus-5"' in agent_write_cmds[0]
+        # The run launches with --agent, and NEVER the broken --model flag.
         run_cmds = self._run_cmds(environment.exec.call_args_list)
-        assert "--model" in run_cmds[0]
-        assert "sonnet-4" in run_cmds[0]
+        assert "--agent aws-bench" in run_cmds[0]
+        assert "--model" not in run_cmds[0]
+
+    @pytest.mark.asyncio
+    async def test_run_without_model_uses_no_agent_flag(self, logs_dir: Path):
+        agent = KiroCli(logs_dir=logs_dir)
+        environment = MagicMock()
+        environment.exec = AsyncMock(return_value=MagicMock(return_code=0, stdout="", stderr=""))
+        context = MagicMock()
+
+        with patch.dict("os.environ", {"KIRO_API_KEY": "ksk_test"}, clear=True):
+            await agent.run("Do the task", environment, context)
+
+        commands = [c.kwargs.get("command", "") for c in environment.exec.call_args_list]
+        # No model -> no agent config written, no --agent/--model on the run.
+        assert not any("~/.kiro/agents/aws-bench.json" in c for c in commands)
+        run_cmds = self._run_cmds(environment.exec.call_args_list)
+        assert "--agent" not in run_cmds[0]
+        assert "--model" not in run_cmds[0]
 
     @pytest.mark.asyncio
     async def test_run_with_effort(self, logs_dir: Path):
