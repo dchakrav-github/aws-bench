@@ -1,8 +1,20 @@
 """Kiro CLI agent for aws-bench.
 
 Installs Kiro CLI into the trial environment, configures auth and MCP servers,
-then runs it non-interactively against the task instruction. Auth uses
-``$KIRO_API_KEY`` from the host shell.
+then runs it non-interactively against the task instruction.
+
+Auth has two modes:
+
+1. **API key (default):** ``$KIRO_API_KEY`` from the host shell is forwarded
+   into the container. This is the headless credential Kiro documents for CI.
+2. **Session mount (opt-in):** when ``$KIRO_API_KEY`` is unset and
+   ``$AWS_BENCH_KIRO_SESSION_MOUNT`` is truthy, the agent reuses an existing
+   host ``kiro-cli login`` session. Only the auth-bearing rows of the host
+   ``data.sqlite3`` (the ``auth_kv``/``state``/``migrations`` tables) are
+   copied into the container — never the host's conversation history,
+   knowledge bases, or any ``~/.kiro`` config, steering, agents, or skills.
+   This keeps enterprise/host configuration out of the trial so the agent runs
+   with its built-in default system prompt only.
 
 Trajectory data is extracted from Kiro CLI's native SQLite database after the
 run completes.
@@ -10,10 +22,12 @@ run completes.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shlex
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +57,82 @@ _CONTAINER_DB_PATH = "~/.local/share/kiro-cli/data.sqlite3"
 # kiro-cli installs into $HOME/.local/bin which is not on PATH for non-login
 # shells spawned by environment.exec.
 _PATH_PREFIX = 'export PATH="$HOME/.local/bin:$PATH"; '
+
+# Opt-in flag: reuse a host `kiro-cli login` session instead of KIRO_API_KEY.
+_SESSION_MOUNT_ENV = "AWS_BENCH_KIRO_SESSION_MOUNT"
+# Host data.sqlite3 that holds the login session (override for testing / custom
+# installs). Defaults to Kiro CLI's standard per-user data path on the host.
+_SESSION_DB_ENV = "KIRO_CLI_SESSION_DB"
+_DEFAULT_HOST_SESSION_DB = "~/.local/share/kiro-cli/data.sqlite3"
+# The only tables copied from the host DB. `auth_kv` carries the login session;
+# `state`/`migrations` let kiro-cli open the DB at the expected schema version.
+# Everything else on the host DB (history, conversations*, knowledge_bases, …)
+# is deliberately excluded so no host data enters the trial.
+_SESSION_AUTH_TABLES = ("auth_kv", "state", "migrations")
+
+
+def _truthy(value: str | None) -> bool:
+    """Return True for common truthy string flag values."""
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_stripped_session_db(host_db: Path, dest_db: Path) -> None:
+    """Copy only the auth-bearing tables from ``host_db`` into a fresh ``dest_db``.
+
+    Copies ``auth_kv``/``state``/``migrations`` and nothing else, so the login
+    session is reused without dragging the host's conversation history or
+    knowledge bases into the trial.
+
+    Args:
+        host_db: Path to the host ``data.sqlite3`` written by ``kiro-cli login``.
+        dest_db: Path to write the stripped copy to (overwritten if present).
+
+    Raises:
+        FileNotFoundError: If ``host_db`` does not exist.
+        KiroSessionError: If the host DB has no ``auth_kv`` table (not logged in).
+    """
+    if not host_db.exists():
+        raise FileNotFoundError(f"Kiro session DB not found: {host_db}")
+    if dest_db.exists():
+        dest_db.unlink()
+
+    src = sqlite3.connect(f"file:{host_db}?mode=ro", uri=True)
+    try:
+        present = {
+            row[0] for row in src.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "auth_kv" not in present:
+            raise KiroSessionError(
+                f"Host Kiro DB {host_db} has no 'auth_kv' table; run `kiro-cli login` first."
+            )
+        dst = sqlite3.connect(dest_db)
+        try:
+            for table in _SESSION_AUTH_TABLES:
+                if table not in present:
+                    continue
+                ddl = src.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                if not ddl or not ddl[0]:
+                    continue
+                dst.execute(ddl[0])
+                rows = src.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608
+                if rows:
+                    placeholders = ",".join("?" * len(rows[0]))
+                    dst.executemany(
+                        f"INSERT INTO {table} VALUES ({placeholders})",  # noqa: S608
+                        rows,
+                    )
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+class KiroSessionError(Exception):
+    """Raised when a host Kiro login session cannot be extracted for mounting."""
 
 
 class KiroCli(BaseInstalledAgent):
@@ -96,17 +186,67 @@ class KiroCli(BaseInstalledAgent):
             mcp_servers[server.name] = entry
         return mcp_servers
 
+    def _session_mount_enabled(self) -> bool:
+        """Whether opt-in host-session mounting is requested."""
+        return _truthy(os.environ.get(_SESSION_MOUNT_ENV))
+
+    def _host_session_db(self) -> Path:
+        """Resolve the host ``data.sqlite3`` that holds the login session."""
+        raw = os.environ.get(_SESSION_DB_ENV) or _DEFAULT_HOST_SESSION_DB
+        return Path(os.path.expanduser(raw))
+
+    def _use_session_mount(self) -> bool:
+        """True when auth should come from a mounted host session, not an API key.
+
+        Session mount applies only when no ``KIRO_API_KEY`` is set and the opt-in
+        flag is on. The API key always takes precedence when present.
+        """
+        return not os.environ.get("KIRO_API_KEY", "") and self._session_mount_enabled()
+
     def _kiro_env(self) -> dict[str, str]:
-        """Collect Kiro CLI env vars from the host."""
-        return {"KIRO_API_KEY": os.environ.get("KIRO_API_KEY", "")}
+        """Collect Kiro CLI env vars from the host.
+
+        Returns ``{"KIRO_API_KEY": ...}`` in API-key mode. In session-mount mode
+        no auth env is needed (the login session is mounted into the container),
+        so an empty dict is returned.
+        """
+        api_key = os.environ.get("KIRO_API_KEY", "")
+        if api_key:
+            return {"KIRO_API_KEY": api_key}
+        return {}
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Validate KIRO_API_KEY before spending time on install."""
+        """Validate auth before spending time on install.
+
+        Accepts either ``KIRO_API_KEY`` (default) or, when
+        ``AWS_BENCH_KIRO_SESSION_MOUNT`` is set and no API key is present, a host
+        ``kiro-cli login`` session. Fails preflight if neither is usable.
+        """
         if not os.environ.get("KIRO_API_KEY", ""):
-            raise PreflightError(
-                "KIRO_API_KEY is not set (or is empty), but the agent is kiro-cli. "
-                "Export it before running: export KIRO_API_KEY=ksk_xxxxxxxx"
-            )
+            if not self._session_mount_enabled():
+                raise PreflightError(
+                    "KIRO_API_KEY is not set (or is empty), but the agent is kiro-cli. "
+                    "Export it before running: export KIRO_API_KEY=ksk_xxxxxxxx\n"
+                    f"Alternatively, set {_SESSION_MOUNT_ENV}=1 to reuse a host "
+                    "`kiro-cli login` session."
+                )
+            host_db = self._host_session_db()
+            if not host_db.exists():
+                raise PreflightError(
+                    f"{_SESSION_MOUNT_ENV} is set but no host Kiro session DB was found at "
+                    f"{host_db}. Run `kiro-cli login` on the host first, or point "
+                    f"{_SESSION_DB_ENV} at the correct data.sqlite3."
+                )
+            # Fail fast if the DB exists but carries no login session.
+            probe_path = Path(tempfile.mkstemp(suffix=".sqlite3", prefix="kiro-session-probe-")[1])
+            try:
+                _build_stripped_session_db(host_db, probe_path)
+            except (KiroSessionError, sqlite3.Error, OSError) as exc:
+                raise PreflightError(
+                    f"Could not extract a Kiro login session from {host_db}: {exc}"
+                ) from exc
+            finally:
+                probe_path.unlink(missing_ok=True)
         await super().setup(environment)
 
     async def install(self, environment: BaseEnvironment) -> None:
@@ -147,12 +287,45 @@ class KiroCli(BaseInstalledAgent):
             ),
         )
 
+    async def _mount_host_session(self, environment: BaseEnvironment) -> None:
+        """Copy a stripped host login session into the container and force clean config.
+
+        Builds a stripped ``data.sqlite3`` (auth tables only) on the host, base64
+        streams it into the container's ``~/.local/share/kiro-cli/data.sqlite3``,
+        and writes an empty ``~/.kiro/settings/cli.json`` so no host default agent
+        (e.g. ``chat.defaultAgent``) is inherited — the built-in default agent and
+        its native system prompt are used.
+        """
+        host_db = self._host_session_db()
+        stripped = self.logs_dir / "kiro-session-auth.sqlite3"
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        _build_stripped_session_db(host_db, stripped)
+
+        payload = base64.b64encode(stripped.read_bytes()).decode("ascii")
+        container_db = _CONTAINER_DB_PATH
+        container_dir = container_db.rsplit("/", 1)[0]
+        # Write a guaranteed-clean cli.json (no defaultAgent) and decode the DB.
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"mkdir -p {container_dir} ~/.kiro/settings && "
+                f"printf '%s' {shlex.quote(payload)} | base64 -d > {container_db} && "
+                f"printf '%s' '{{}}' > ~/.kiro/settings/cli.json"
+            ),
+        )
+
     @with_prompt_template
     async def run(
         self, instruction: str, environment: BaseEnvironment, context: AgentContext
     ) -> None:
         """Execute a task using kiro-cli in headless mode."""
         env = self._kiro_env()
+        use_session_mount = self._use_session_mount()
+
+        # In session-mount mode, reuse the host login (auth tables only) and pin
+        # a clean config so the trial runs with the built-in default agent.
+        if use_session_mount:
+            await self._mount_host_session(environment)
 
         # Write MCP server config if any servers are configured
         mcp_servers = self._build_mcp_json(self.mcp_servers)
@@ -178,12 +351,15 @@ class KiroCli(BaseInstalledAgent):
         # a request matches. Verified with kiro-cli 2.21.2 that a skill present
         # only in ~/.kiro/skills/ is discovered and used.
         #
+        # Skipped entirely in session-mount mode: that path deliberately keeps all
+        # host ~/.kiro content (including skills) out of the trial for a clean slate.
+        #
         # Write the resolved home and copied-skill count to /logs/agent/ (which is
         # collected with the run) rather than stdout: environment.exec discards
         # command stdout, so an echoed marker would never surface in the logs.
         # This makes a run that staged no skills easy to spot (global=0 means the
         # copy found nothing at skills_dir).
-        if self.skills_dir:
+        if self.skills_dir and not use_session_mount:
             src = shlex.quote(self.skills_dir)
             await self.exec_as_agent(
                 environment,
