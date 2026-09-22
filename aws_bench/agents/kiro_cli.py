@@ -502,8 +502,13 @@ class KiroCli(BaseInstalledAgent):
           ``agent_thought_chunk`` (reasoning; not emitted as steps).
         - ``runFinished`` — ``status``, ``stopReason``, ``finalText``.
 
-        Each tool call becomes one agent Step (tool_call + its observation);
-        the assembled assistant text becomes a final agent Step.
+        Steps are emitted **in event order** so assistant reasoning is
+        interleaved with the tool calls it precedes, rather than collapsed into
+        one final blob. Concretely: a run of ``agent_message_chunk`` text that is
+        immediately followed by tool calls is the model's reasoning *before*
+        those calls and becomes the ``message`` of the next tool step; a run of
+        text with no following tool call is the final answer and becomes the last
+        step. Each tool call is one Step (tool_call + its observation).
         """
         session_id = "unknown"
         engine: str | None = None
@@ -513,10 +518,14 @@ class KiroCli(BaseInstalledAgent):
         final_status: str | None = None
         final_text: str | None = None
 
-        # toolCallId -> {name, args, purpose, title, observation, status}
+        # Ordered scaffolding: tool-call entries in first-seen order, plus the
+        # assistant text that preceded each. `pending_text` accumulates
+        # agent_message_chunk text until the next tool call consumes it (or the
+        # run ends, making it the final answer).
         tool_calls: dict[str, dict[str, Any]] = {}
         tool_order: list[str] = []
-        assistant_text_parts: list[str] = []
+        pending_text = ""
+        trailing_text = ""
 
         for event in events:
             etype = event.get("type")
@@ -537,12 +546,49 @@ class KiroCli(BaseInstalledAgent):
                 final_status = data.get("status")
                 final_text = data.get("finalText")
             elif etype == "sessionUpdate":
-                self._apply_session_update(
-                    data.get("update") or {},
-                    tool_calls,
-                    tool_order,
-                    assistant_text_parts,
-                )
+                update = data.get("update") or {}
+                kind = update.get("sessionUpdate")
+                if kind == "agent_message_chunk":
+                    content = update.get("content") or {}
+                    text = content.get("text") if isinstance(content, dict) else None
+                    if text:
+                        pending_text += text
+                        trailing_text += text
+                elif kind == "tool_call":
+                    call_id = update.get("toolCallId") or ""
+                    if not call_id:
+                        continue
+                    if call_id not in tool_calls:
+                        tool_order.append(call_id)
+                        # The text accumulated since the last tool call is this
+                        # call's pre-call reasoning. Only the first call in a
+                        # parallel batch claims the run.
+                        tool_calls[call_id] = {"reasoning": pending_text.strip()}
+                        pending_text = ""
+                        trailing_text = ""
+                    entry = tool_calls[call_id]
+                    entry["name"] = ((update.get("_meta") or {}).get("kiro") or {}).get("toolName")
+                    entry["args"] = update.get("rawInput") or {}
+                    entry["title"] = update.get("title")
+                elif kind == "tool_call_update":
+                    call_id = update.get("toolCallId") or ""
+                    if not call_id:
+                        continue
+                    if call_id not in tool_calls:
+                        tool_order.append(call_id)
+                        tool_calls[call_id] = {"reasoning": pending_text.strip()}
+                        pending_text = ""
+                        trailing_text = ""
+                    entry = tool_calls[call_id]
+                    if update.get("rawInput") and not entry.get("args"):
+                        entry["args"] = update.get("rawInput")
+                    if update.get("title") and not entry.get("title"):
+                        entry["title"] = update.get("title")
+                    text, is_error = self._extract_tool_output(update)
+                    if text is not None:
+                        entry["observation"] = text
+                    if is_error:
+                        entry["is_error"] = True
 
         steps: list[Step] = []
         n_tool_errors = 0
@@ -555,18 +601,16 @@ class KiroCli(BaseInstalledAgent):
             observation = None
             if call.get("observation") is not None:
                 observation = Observation(
-                    results=[
-                        ObservationResult(
-                            source_call_id=call_id,
-                            content=call["observation"],
-                        )
-                    ]
+                    results=[ObservationResult(source_call_id=call_id, content=call["observation"])]
                 )
+            # Prefer the model's own pre-call reasoning as the step message; fall
+            # back to the tool's declared purpose, then its title.
+            message = call.get("reasoning") or purpose or call.get("title") or ""
             steps.append(
                 Step(
                     step_id=len(steps) + 1,
                     source="agent",
-                    message=purpose or call.get("title") or "",
+                    message=message,
                     tool_calls=[
                         ToolCall(
                             tool_call_id=call_id,
@@ -579,13 +623,14 @@ class KiroCli(BaseInstalledAgent):
                 )
             )
 
-        assistant_message = "".join(assistant_text_parts).strip() or (final_text or "")
-        if assistant_message:
+        # Text left after the last tool call is the final answer.
+        final_answer = trailing_text.strip() or (final_text or "").strip()
+        if final_answer:
             steps.append(
                 Step(
                     step_id=len(steps) + 1,
                     source="agent",
-                    message=assistant_message,
+                    message=final_answer,
                     model_name=self.model_name,
                 )
             )
@@ -616,47 +661,6 @@ class KiroCli(BaseInstalledAgent):
             steps=steps,
             final_metrics=metrics,
         )
-
-    @staticmethod
-    def _apply_session_update(
-        update: dict[str, Any],
-        tool_calls: dict[str, dict[str, Any]],
-        tool_order: list[str],
-        assistant_text_parts: list[str],
-    ) -> None:
-        """Fold one ``sessionUpdate`` payload into the accumulating trajectory state."""
-        kind = update.get("sessionUpdate")
-        if kind == "tool_call":
-            call_id = update.get("toolCallId") or ""
-            if not call_id:
-                return
-            if call_id not in tool_calls:
-                tool_order.append(call_id)
-            entry = tool_calls.setdefault(call_id, {})
-            entry["name"] = ((update.get("_meta") or {}).get("kiro") or {}).get("toolName")
-            entry["args"] = update.get("rawInput") or {}
-            entry["title"] = update.get("title")
-        elif kind == "tool_call_update":
-            call_id = update.get("toolCallId") or ""
-            if not call_id:
-                return
-            if call_id not in tool_calls:
-                tool_order.append(call_id)
-            entry = tool_calls.setdefault(call_id, {})
-            if update.get("rawInput") and not entry.get("args"):
-                entry["args"] = update.get("rawInput")
-            if update.get("title") and not entry.get("title"):
-                entry["title"] = update.get("title")
-            text, is_error = KiroCli._extract_tool_output(update)
-            if text is not None:
-                entry["observation"] = text
-            if is_error:
-                entry["is_error"] = True
-        elif kind == "agent_message_chunk":
-            content = update.get("content") or {}
-            text = content.get("text") if isinstance(content, dict) else None
-            if text:
-                assistant_text_parts.append(text)
 
     @staticmethod
     def _extract_tool_output(update: dict[str, Any]) -> tuple[str | None, bool]:

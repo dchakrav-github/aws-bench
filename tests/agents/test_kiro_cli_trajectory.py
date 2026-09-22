@@ -227,6 +227,143 @@ class TestStreamJsonToTrajectory:
         assert [s.step_id for s in traj.steps] == list(range(1, len(traj.steps) + 1))
 
 
+class TestInterleavedReasoning:
+    """Reasoning attaches to the tool step it precedes.
+
+    The final answer is a separate last step (not glued to earlier reasoning).
+    """
+
+    def _events_two_rounds(self) -> list[dict]:
+        # reasoning A -> tool t1 ; reasoning B -> tool t2 ; final answer C
+        return [
+            {"type": "runStarted", "data": {"engine": "v2"}},
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "First "},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "I list regions."},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Running: aws ec2 describe-regions",
+                    "rawInput": {"command": "aws ec2 describe-regions"},
+                    "_meta": {"kiro": {"toolName": "shell"}},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "t1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "items": [{"Json": {"exit_status": "exit status: 0", "stdout": "ok"}}]
+                    },
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Now the "},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "compact view."},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t2",
+                    "title": "Running: aws ec2 describe-instances",
+                    "rawInput": {"command": "aws ec2 describe-instances"},
+                    "_meta": {"kiro": {"toolName": "shell"}},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "t2",
+                    "status": "completed",
+                    "rawOutput": {
+                        "items": [{"Json": {"exit_status": "exit status: 0", "stdout": "ok"}}]
+                    },
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Done: "},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "2 instances."},
+                }
+            ),
+            {
+                "type": "runFinished",
+                "data": {"status": "success", "finalText": "Done: 2 instances."},
+            },
+        ]
+
+    def test_reasoning_attaches_to_next_tool_step(self, agent: KiroCli, logs_dir: Path):
+        _write_stream(logs_dir, self._events_two_rounds())
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        assert len(traj.steps) == 3  # two tool steps + one final answer
+        # Pre-call reasoning lands on the tool step it preceded.
+        assert traj.steps[0].message == "First I list regions."
+        assert traj.steps[0].tool_calls is not None
+        assert traj.steps[1].message == "Now the compact view."
+        assert traj.steps[1].tool_calls is not None
+
+    def test_final_answer_is_separate_last_step(self, agent: KiroCli, logs_dir: Path):
+        _write_stream(logs_dir, self._events_two_rounds())
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        last = traj.steps[-1]
+        assert last.tool_calls is None
+        assert last.message == "Done: 2 instances."
+        # The earlier reasoning is NOT glued into the final answer.
+        assert "list regions" not in (last.message or "")
+        assert "compact view" not in (last.message or "")
+
+    def test_reasoning_falls_back_to_purpose_then_title(self, agent: KiroCli, logs_dir: Path):
+        # No agent_message_chunk before the tool -> use __tool_use_purpose.
+        events = [
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Running: echo hi",
+                    "rawInput": {"command": "echo hi", "__tool_use_purpose": "greet"},
+                    "_meta": {"kiro": {"toolName": "shell"}},
+                }
+            ),
+        ]
+        _write_stream(logs_dir, events)
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        assert traj.steps[0].message == "greet"
+
+
 class TestPopulateContextPostRun:
     def test_no_stream_file_is_noop(self, agent: KiroCli):
         context = MagicMock()
