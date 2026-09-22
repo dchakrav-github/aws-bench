@@ -498,17 +498,22 @@ class KiroCli(BaseInstalledAgent):
           ``tool_call`` (new call: ``toolCallId``, ``rawInput`` args,
           ``_meta.kiro.toolName``), ``tool_call_update`` (``status``,
           ``rawOutput.items[].Json`` with exit_status/stdout/stderr),
-          ``agent_message_chunk`` (streamed assistant text), and
-          ``agent_thought_chunk`` (reasoning; not emitted as steps).
+          ``agent_message_chunk`` (streamed user-facing text), and
+          ``agent_thought_chunk`` (the model's reasoning/thinking stream).
         - ``runFinished`` — ``status``, ``stopReason``, ``finalText``.
 
-        Steps are emitted **in event order** so assistant reasoning is
-        interleaved with the tool calls it precedes, rather than collapsed into
-        one final blob. Concretely: a run of ``agent_message_chunk`` text that is
-        immediately followed by tool calls is the model's reasoning *before*
+        Steps are emitted **in event order** so assistant text is interleaved
+        with the tool calls it precedes, rather than collapsed into one final
+        blob. Concretely: a run of ``agent_message_chunk`` text that is
+        immediately followed by tool calls is the model's narration *before*
         those calls and becomes the ``message`` of the next tool step; a run of
         text with no following tool call is the final answer and becomes the last
         step. Each tool call is one Step (tool_call + its observation).
+
+        ``agent_thought_chunk`` (reasoning) is accumulated the same way and
+        attached to the same step boundary, but stored in the structured
+        ``reasoning_content`` field rather than ``message`` — keeping the
+        user-facing text and the private reasoning distinct.
         """
         session_id = "unknown"
         engine: str | None = None
@@ -519,13 +524,15 @@ class KiroCli(BaseInstalledAgent):
         final_text: str | None = None
 
         # Ordered scaffolding: tool-call entries in first-seen order, plus the
-        # assistant text that preceded each. `pending_text` accumulates
-        # agent_message_chunk text until the next tool call consumes it (or the
-        # run ends, making it the final answer).
+        # assistant text/thought that preceded each. `pending_*` accumulate
+        # agent_message_chunk / agent_thought_chunk until the next tool call
+        # consumes them (or the run ends, making them the final answer step).
         tool_calls: dict[str, dict[str, Any]] = {}
         tool_order: list[str] = []
         pending_text = ""
+        pending_thought = ""
         trailing_text = ""
+        trailing_thought = ""
 
         for event in events:
             etype = event.get("type")
@@ -554,18 +561,29 @@ class KiroCli(BaseInstalledAgent):
                     if text:
                         pending_text += text
                         trailing_text += text
+                elif kind == "agent_thought_chunk":
+                    content = update.get("content") or {}
+                    text = content.get("text") if isinstance(content, dict) else None
+                    if text:
+                        pending_thought += text
+                        trailing_thought += text
                 elif kind == "tool_call":
                     call_id = update.get("toolCallId") or ""
                     if not call_id:
                         continue
                     if call_id not in tool_calls:
                         tool_order.append(call_id)
-                        # The text accumulated since the last tool call is this
-                        # call's pre-call reasoning. Only the first call in a
-                        # parallel batch claims the run.
-                        tool_calls[call_id] = {"reasoning": pending_text.strip()}
+                        # The text/thought accumulated since the last tool call
+                        # is this call's pre-call narration and reasoning. Only
+                        # the first call in a parallel batch claims the run.
+                        tool_calls[call_id] = {
+                            "reasoning": pending_text.strip(),
+                            "thought": pending_thought.strip(),
+                        }
                         pending_text = ""
+                        pending_thought = ""
                         trailing_text = ""
+                        trailing_thought = ""
                     entry = tool_calls[call_id]
                     entry["name"] = ((update.get("_meta") or {}).get("kiro") or {}).get("toolName")
                     entry["args"] = update.get("rawInput") or {}
@@ -576,9 +594,14 @@ class KiroCli(BaseInstalledAgent):
                         continue
                     if call_id not in tool_calls:
                         tool_order.append(call_id)
-                        tool_calls[call_id] = {"reasoning": pending_text.strip()}
+                        tool_calls[call_id] = {
+                            "reasoning": pending_text.strip(),
+                            "thought": pending_thought.strip(),
+                        }
                         pending_text = ""
+                        pending_thought = ""
                         trailing_text = ""
+                        trailing_thought = ""
                     entry = tool_calls[call_id]
                     if update.get("rawInput") and not entry.get("args"):
                         entry["args"] = update.get("rawInput")
@@ -603,14 +626,15 @@ class KiroCli(BaseInstalledAgent):
                 observation = Observation(
                     results=[ObservationResult(source_call_id=call_id, content=call["observation"])]
                 )
-            # Prefer the model's own pre-call reasoning as the step message; fall
-            # back to the tool's declared purpose, then its title.
+            # Prefer the model's own pre-call narration as the step message;
+            # fall back to the tool's declared purpose, then its title.
             message = call.get("reasoning") or purpose or call.get("title") or ""
             steps.append(
                 Step(
                     step_id=len(steps) + 1,
                     source="agent",
                     message=message,
+                    reasoning_content=call.get("thought") or None,
                     tool_calls=[
                         ToolCall(
                             tool_call_id=call_id,
@@ -625,12 +649,14 @@ class KiroCli(BaseInstalledAgent):
 
         # Text left after the last tool call is the final answer.
         final_answer = trailing_text.strip() or (final_text or "").strip()
-        if final_answer:
+        final_reasoning = trailing_thought.strip() or None
+        if final_answer or final_reasoning:
             steps.append(
                 Step(
                     step_id=len(steps) + 1,
                     source="agent",
                     message=final_answer,
+                    reasoning_content=final_reasoning,
                     model_name=self.model_name,
                 )
             )

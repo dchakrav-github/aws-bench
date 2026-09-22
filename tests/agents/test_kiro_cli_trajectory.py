@@ -364,6 +364,142 @@ class TestInterleavedReasoning:
         assert traj.steps[0].message == "greet"
 
 
+class TestThoughtCapture:
+    """agent_thought_chunk reasoning is captured in Step.reasoning_content.
+
+    It attaches to the same step boundary as message text, but stays separate
+    from the user-facing ``message``.
+    """
+
+    def test_thought_before_tool_sets_reasoning_content(self, agent: KiroCli, logs_dir: Path):
+        events = [
+            _su(
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "I need to "},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "check route tables."},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Checking routes."},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Running: aws ec2 describe-route-tables",
+                    "rawInput": {"command": "aws ec2 describe-route-tables"},
+                    "_meta": {"kiro": {"toolName": "use_aws"}},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "t1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "items": [{"Json": {"exit_status": "exit status: 0", "stdout": "ok"}}]
+                    },
+                }
+            ),
+        ]
+        _write_stream(logs_dir, events)
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        step = traj.steps[0]
+        # Reasoning captured in the structured field...
+        assert step.reasoning_content == "I need to check route tables."
+        # ...and the user-facing message is untouched (not polluted with thought).
+        assert step.message == "Checking routes."
+        assert "check route tables" not in (step.message or "")
+
+    def test_trailing_thought_on_final_step(self, agent: KiroCli, logs_dir: Path):
+        events = [
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Running: echo hi",
+                    "rawInput": {"command": "echo hi"},
+                    "_meta": {"kiro": {"toolName": "shell"}},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "t1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "items": [{"Json": {"exit_status": "exit status: 0", "stdout": "hi"}}]
+                    },
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "All done "},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": {"type": "text", "text": "thinking."},
+                }
+            ),
+            _su(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "Result: hi"},
+                }
+            ),
+            {"type": "runFinished", "data": {"status": "success", "finalText": "Result: hi"}},
+        ]
+        _write_stream(logs_dir, events)
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        last = traj.steps[-1]
+        assert last.tool_calls is None
+        assert last.message == "Result: hi"
+        assert last.reasoning_content == "All done thinking."
+
+    def test_no_thought_leaves_reasoning_content_none(self, agent: KiroCli, logs_dir: Path):
+        events = [
+            _su(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "t1",
+                    "title": "Running: echo hi",
+                    "rawInput": {"command": "echo hi"},
+                    "_meta": {"kiro": {"toolName": "shell"}},
+                }
+            ),
+        ]
+        _write_stream(logs_dir, events)
+        traj = agent._stream_json_to_trajectory(
+            agent._read_stream_json(logs_dir / _STREAM_JSON_FILENAME)
+        )
+        assert traj is not None
+        assert traj.steps[0].reasoning_content is None
+
+    def test_real_fixture_populates_reasoning(self, agent: KiroCli):
+        # The rich fixture has a thought run before the tool batch.
+        traj = agent._stream_json_to_trajectory(agent._read_stream_json(FIXTURE))
+        assert traj is not None
+        assert any(s.reasoning_content for s in traj.steps)
+
+
 class TestPopulateContextPostRun:
     def test_no_stream_file_is_noop(self, agent: KiroCli):
         context = MagicMock()
