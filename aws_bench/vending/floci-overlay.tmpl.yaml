@@ -1,0 +1,46 @@
+# Floci vending overlay TEMPLATE (owned by aws-bench, not the dataset).
+#
+# This is the single, global Docker Compose overlay that redirects a trial's
+# agent (and shared-mode verifier) to a local Floci AWS emulator instead of real
+# AWS, with no change to the task/dataset. It is passed to the runner once per
+# run via:
+#
+#     aws-bench run ... --extra-docker-compose <this-file-rendered>
+#
+# Harbor layers it onto the `main` service (the container both the agent phase
+# and the shared verifier run in). It joins Floci's network, points DNS at the
+# split-horizon resolver (AWS names -> Floci; agent tool-downloads + Bedrock
+# inference -> real internet), trusts the vending CA, and sets dummy creds.
+# Isolated benchmark use only; it uses no real AWS credentials.
+#
+# Placeholders are rendered at setup time (setup_vending.sh writes the ready-to-
+# use file), because the values are run-specific:
+#   __FLOCI_DNS_IP__   live split-horizon DNS resolver IP (changes per bring-up)
+#   __FLOCI_CA_PATH__  absolute host path to the minted CA (vending/tls/ca.pem)
+#   __VEND_NET__       the external docker network Floci + DNS share
+#
+# Unlike the old per-task override, the CA is mounted from an ABSOLUTE host path
+# (not ./floci-ca.pem), so a single overlay works for every task without copying
+# a CA into each task's environment/ dir.
+services:
+  main:
+    dns:
+      - "__FLOCI_DNS_IP__"
+    volumes:
+      - "__FLOCI_CA_PATH__:/floci/ca.pem:ro"
+    environment:
+      AWS_CA_BUNDLE: /floci/ca.pem
+      REQUESTS_CA_BUNDLE: /floci/ca.pem
+      SSL_CERT_FILE: /floci/ca.pem
+      CURL_CA_BUNDLE: /floci/ca.pem
+      NODE_EXTRA_CA_CERTS: /floci/ca.pem
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+    networks:
+      - __VEND_NET__
+
+networks:
+  __VEND_NET__:
+    external: true
