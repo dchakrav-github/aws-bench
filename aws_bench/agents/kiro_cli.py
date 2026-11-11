@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shlex
 import sqlite3
 import tempfile
@@ -72,6 +73,9 @@ _SESSION_MOUNT_ENV = "AWS_BENCH_KIRO_SESSION_MOUNT"
 # installs). Defaults to Kiro CLI's standard per-user data path on the host.
 _SESSION_DB_ENV = "KIRO_CLI_SESSION_DB"
 _DEFAULT_HOST_SESSION_DB = "~/.local/share/kiro-cli/data.sqlite3"
+# Optional host env pinning the kiro-cli release downloaded into the trial
+# (e.g. "2.27.1"); default "latest".
+_KIRO_VERSION_ENV = "AWS_BENCH_KIRO_VERSION"
 # The only tables copied from the host DB. `auth_kv` carries the login session;
 # `state`/`migrations` let kiro-cli open the DB at the expected schema version.
 # Everything else on the host DB (history, conversations*, knowledge_bases, …)
@@ -258,7 +262,19 @@ class KiroCli(BaseInstalledAgent):
         await super().setup(environment)
 
     async def install(self, environment: BaseEnvironment) -> None:
-        """Install kiro-cli binary in the agent environment."""
+        """Install kiro-cli binary in the agent environment.
+
+        ``$AWS_BENCH_KIRO_VERSION`` (host env) pins the release, e.g. ``2.27.1``;
+        default ``latest``. The 2.x installer forwards its args to
+        ``kiro-cli setup`` (which takes ``--force --no-confirm``); the 3.x
+        installer rejects unknown args, so those flags are passed only for 2.x.
+        """
+        version = (os.environ.get(_KIRO_VERSION_ENV) or "latest").strip()
+        if not re.fullmatch(r"latest|\d+\.\d+\.\d+", version):
+            raise PreflightError(
+                f"{_KIRO_VERSION_ENV}={version!r} is invalid; use 'latest' or X.Y.Z."
+            )
+        setup_args = " --force --no-confirm" if version.startswith("2.") else ""
         await self.exec_as_root(
             environment,
             command=(
@@ -282,11 +298,10 @@ class KiroCli(BaseInstalledAgent):
                 "case $ARCH in x86_64) KIRO_ARCH=x86_64;; aarch64|arm64) KIRO_ARCH=aarch64;; "
                 '*) echo "Unsupported architecture: $ARCH"; exit 1;; esac; '
                 "curl --proto '=https' --tlsv1.2 -sSf "
-                '"https://desktop-release.q.us-east-1.amazonaws.com/latest/'
-                'kirocli-${KIRO_ARCH}-linux.zip" '
+                '"https://desktop-release.q.us-east-1.amazonaws.com/'
+                f'{version}/kirocli-${{KIRO_ARCH}}-linux.zip" '
                 "-o /tmp/kirocli.zip && "
-                "cd /tmp && unzip -q kirocli.zip && "
-                "./kirocli/install.sh --force --no-confirm && "
+                f"cd /tmp && unzip -q kirocli.zip && ./kirocli/install.sh{setup_args} && "
                 "rm -rf /tmp/kirocli.zip /tmp/kirocli && "
                 f"{_PATH_PREFIX}"
                 "kiro-cli --version && "
