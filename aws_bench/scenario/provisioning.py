@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -438,9 +439,24 @@ async def _emit(
         logger.warning("on_event for %s/%s raised: %s", scenario_name, account_tag, exc)
 
 
-_ACCOUNT_CREATION_MAX_CONCURRENT = 3
+def _account_creation_max_concurrent() -> int:
+    """Hard cap on concurrent account-creation calls regardless of ``n_concurrent``.
+
+    Defaults to 3. ``AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY`` raises it, clamped to
+    AWS Organizations' limit of 5 member-account creations in progress at a time
+    (https://docs.aws.amazon.com/organizations/latest/userguide/orgs_reference_limits.html).
+    """
+    raw = os.environ.get("AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY", "")
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        logger.warning("Ignoring non-integer AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY=%r", raw)
+        value = 3
+    return max(1, min(value, _ORG_CREATE_ACCOUNT_IN_PROGRESS_LIMIT))
+
+
+_ORG_CREATE_ACCOUNT_IN_PROGRESS_LIMIT = 5
 _ACCOUNT_CONVERGENCE_DELAY_SEC = 180
-"""Hard cap on concurrent account-creation calls regardless of ``n_concurrent``."""
 
 
 async def _provision_all(
@@ -455,16 +471,18 @@ async def _provision_all(
 ) -> list[ProvisionedAccount]:
     """Provision every (scenario, account_tag) pair in two phases.
 
-    Phase 1 — Account creation, bounded by ``min(n_concurrent, _ACCOUNT_CREATION_MAX_CONCURRENT)``.
+    Phase 1 — Account creation, bounded by ``n_concurrent`` and
+    ``_account_creation_max_concurrent()``.
     Phase 2 — Role wait + quota submission + baseline capture, bounded by ``n_concurrent``.
     """
-    # Phase 1: Create accounts with hard cap of 3 concurrent.
+    # Phase 1: Create accounts, capped (default 3, max 5 = AWS in-progress limit).
+    creation_cap = min(n_concurrent, _account_creation_max_concurrent())
     logger.info(
         "Phase 1: Creating %d account(s) (max %d concurrent)",
         len(pairs),
-        min(n_concurrent, _ACCOUNT_CREATION_MAX_CONCURRENT),
+        creation_cap,
     )
-    creation_sem = asyncio.Semaphore(min(n_concurrent, _ACCOUNT_CREATION_MAX_CONCURRENT))
+    creation_sem = asyncio.Semaphore(creation_cap)
 
     async def _create_one(scenario: ScenarioManifest, account_tag: str) -> ProvisionedAccount:
         async with creation_sem:

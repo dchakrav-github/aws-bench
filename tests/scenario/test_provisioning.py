@@ -1602,3 +1602,20 @@ def test_provision_scenarios_no_quota_action_without_limit_error(mocks, tmp_path
 
     qm.request_org_account_quota_if_absent.assert_not_called()
     assert result.n_total == 1
+
+
+class TestAccountCreationConcurrency:
+    """AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY bounds phase-1 creates (default 3, max 5)."""
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [(None, 3), ("", 3), ("5", 5), ("4", 4), ("9", 5), ("0", 1), ("-2", 1), ("abc", 3)],
+    )
+    def test_cap(self, monkeypatch, raw, expected):
+        from aws_bench.scenario.provisioning import _account_creation_max_concurrent
+
+        if raw is None:
+            monkeypatch.delenv("AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY", raising=False)
+        else:
+            monkeypatch.setenv("AWS_BENCH_ACCOUNT_CREATION_CONCURRENCY", raw)
+        assert _account_creation_max_concurrent() == expected
